@@ -25,6 +25,8 @@ import (
 	"github.com/rcrowley/go-metrics"
 
 	"github.com/blevesearch/bleve"
+	"github.com/blevesearch/bleve/document"
+	"github.com/blevesearch/bleve/index"
 
 	log "github.com/couchbaselabs/clog"
 )
@@ -57,18 +59,21 @@ type BleveDest struct {
 
 // Used to track state for a single partition.
 type BleveDestPartition struct {
-	bdest           *BleveDest
-	bindex          bleve.Index
-	partition       string
-	partitionOpaque []byte // Key used to implement SetOpaque/GetOpaque().
+	bdest              *BleveDest
+	bindex             bleve.Index
+	partition          string
+	partitionOpaque    []byte // Key used to implement SetOpaque/GetOpaque().
+	partitionOpaqueStr string
 
-	m           sync.Mutex   // Protects the fields that follow.
-	seqMax      uint64       // Max seq # we've seen for this partition.
-	seqMaxBuf   []byte       // For binary encoded seqMax uint64.
-	seqMaxBatch uint64       // Max seq # that got through batch apply/commit.
-	seqSnapEnd  uint64       // To track snapshot end seq # for this partition.
-	buf         []byte       // Batch points to slices of buf, which we reuse.
-	batch       *bleve.Batch // Batch applied when too big or we hit seqSnapEnd.
+	m           sync.Mutex // Protects the fields that follow.
+	seqMax      uint64     // Max seq # we've seen for this partition.
+	seqMaxBuf   []byte     // For binary encoded seqMax uint64.
+	seqMaxBatch uint64     // Max seq # that got through batch apply/commit.
+	seqSnapEnd  uint64     // To track snapshot end seq # for this partition.
+	buf         []byte     // The batch points to slices of buf, which we reuse.
+
+	batchOps         map[string][]byte
+	batchInternalOps map[string][]byte
 
 	lastOpaque []byte // Cache most recent value for SetOpaque()/GetOpaque().
 	lastUUID   string // Cache most recent partition UUID from lastOpaque.
@@ -280,14 +285,17 @@ func (t *BleveDest) getPartitionUnlocked(partition string) (
 	bdp, exists := t.partitions[partition]
 	if !exists || bdp == nil {
 		bdp = &BleveDestPartition{
-			bdest:           t,
-			bindex:          t.bindex,
-			partition:       partition,
-			partitionOpaque: []byte("o:" + partition),
-			seqMaxBuf:       make([]byte, 8), // Binary encoded seqMax uint64.
-			batch:           bleve.NewBatch(),
-			cwrQueue:        cwrQueue{},
+			bdest:              t,
+			bindex:             t.bindex,
+			partition:          partition,
+			partitionOpaqueStr: "o:" + partition,
+			seqMaxBuf:          make([]byte, 8), // Binary encoded seqMax uint64.
+			batchOps:           make(map[string][]byte),
+			batchInternalOps:   make(map[string][]byte),
+			cwrQueue:           cwrQueue{},
 		}
+		bdp.partitionOpaque = []byte(bdp.partitionOpaqueStr)
+
 		heap.Init(&bdp.cwrQueue)
 
 		t.partitions[partition] = bdp
@@ -502,7 +510,7 @@ func (t *BleveDestPartition) OnDataUpdate(partition string,
 	t.m.Lock()
 
 	bufVal := t.appendToBufUnlocked(val)
-	t.batch.Index(string(key), bufVal) // TODO: string(key) makes garbage?
+	t.batchOps[string(key)] = bufVal // TODO: string(key) makes garbage?
 	err := t.updateSeqUnlocked(seq)
 
 	t.m.Unlock()
@@ -513,7 +521,7 @@ func (t *BleveDestPartition) OnDataDelete(partition string,
 	key []byte, seq uint64) error {
 	t.m.Lock()
 
-	t.batch.Delete(string(key)) // TODO: string(key) makes garbage?
+	t.batchOps[string(key)] = nil // TODO: string(key) makes garbage?
 	err := t.updateSeqUnlocked(seq)
 
 	t.m.Unlock()
@@ -541,8 +549,7 @@ func (t *BleveDestPartition) SetOpaque(partition string, value []byte) error {
 
 	t.lastOpaque = append(t.lastOpaque[0:0], value...)
 	t.lastUUID = parseOpaqueToUUID(value)
-
-	t.batch.SetInternal(t.partitionOpaque, t.lastOpaque)
+	t.batchInternalOps[t.partitionOpaqueStr] = t.lastOpaque
 
 	t.m.Unlock()
 	return nil
@@ -621,9 +628,7 @@ func (t *BleveDestPartition) updateSeqUnlocked(seq uint64) error {
 	if t.seqMax < seq {
 		t.seqMax = seq
 		binary.BigEndian.PutUint64(t.seqMaxBuf, t.seqMax)
-
-		// NOTE: No copy of partition to buf as it's immutatable string bytes.
-		t.batch.SetInternal([]byte(t.partition), t.seqMaxBuf)
+		t.batchInternalOps[t.partition] = t.seqMaxBuf
 	}
 
 	if seq < t.seqSnapEnd {
@@ -635,7 +640,45 @@ func (t *BleveDestPartition) updateSeqUnlocked(seq uint64) error {
 
 func (t *BleveDestPartition) applyBatchUnlocked() error {
 	err := Timer(func() error {
-		return t.bindex.Batch(t.batch)
+		im := t.bindex.Mapping()
+		if im == nil {
+			return fmt.Errorf("bleve: unexpected nil mapping")
+		}
+
+		ii, _, err := t.bindex.Advanced()
+		if err != nil {
+			return err
+		}
+
+		// The code approach here comes originally from bleve's
+		// indexImpl.Batch() "porcelain" API.
+		ib := index.NewBatch()
+
+		for bk, bd := range t.batchOps {
+			if bd != nil {
+				doc := document.NewDocument(bk)
+				err := im.MapDocument(doc, bd)
+				if err == nil {
+					ib.Update(doc)
+				} else {
+					// TODO: Capture mapping error here, but keep going.
+					// The idea is a non-mappable doc (ex: non-JSON)
+					// shouldn't stop the whole batch.
+				}
+			} else {
+				ib.Delete(bk)
+			}
+		}
+
+		for ik, iv := range t.batchInternalOps {
+			if iv != nil {
+				ib.SetInternal([]byte(ik), iv)
+			} else {
+				ib.DeleteInternal([]byte(ik))
+			}
+		}
+
+		return ii.Batch(ib)
 	}, t.bdest.stats.TimerBatchStore)
 	if err != nil {
 		return err
@@ -651,10 +694,12 @@ func (t *BleveDestPartition) applyBatchUnlocked() error {
 		}
 	}
 
-	// TODO: would good to reuse batch; ask for a public Reset() kind
-	// of method on bleve.Batch?
-	t.batch = bleve.NewBatch()
-
+	for bk, _ := range t.batchOps {
+		delete(t.batchOps, bk)
+	}
+	for ik, _ := range t.batchInternalOps {
+		delete(t.batchInternalOps, ik)
+	}
 	if t.buf != nil {
 		t.buf = t.buf[0:0] // Reset t.buf via re-slice.
 	}
